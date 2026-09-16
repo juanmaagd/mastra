@@ -349,12 +349,14 @@ export function clearCopilotCatalogCache(): void {
  *
  * Concurrent calls during a fetch share the inflight promise.
  */
-export async function getCopilotModelCatalog(opts: { authStorage?: AuthStorage } = {}): Promise<CopilotModelEntry[]> {
+export async function getCopilotModelCatalog(
+  opts: { authStorage?: CredentialStore } = {},
+): Promise<CopilotModelEntry[]> {
   const storage = opts.authStorage ?? getAuthStorage();
 
   // Resolve one coherent credential snapshot before consulting the cache so a
   // token can never be paired with another account's enterprise endpoint.
-  const credential = await storage.getOAuthCredential(COPILOT_PROVIDER_ID);
+  const credential = await storage.getOAuthCredential?.(COPILOT_PROVIDER_ID);
   if (!credential || credential.type !== 'oauth') return [];
   const accessToken = credential.access;
   const enterpriseUrl = (credential as GitHubCopilotCredentials).enterpriseUrl;
