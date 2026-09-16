@@ -1978,6 +1978,9 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                       !isEagerlyExecutableToolCall({
                         toolCall,
                         tool: currentStep.tools?.[toolCall.toolName],
+                        // Read at dispatch, not at coordinator construction, so a
+                        // `prepareStep` that reshapes the tool set for this step is
+                        // the version the predicate sees.
                         activeTools: readScoped(scopeCtx, STEP_ACTIVE_TOOLS_KEY, 'stepActiveTools') as
                           | string[]
                           | undefined,
@@ -1990,6 +1993,16 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                         ),
                         isProviderTool,
                         getNeedsApprovalFn,
+                        backgroundTaskManager: readScoped(
+                          scopeCtx,
+                          BACKGROUND_TASK_MANAGER_KEY,
+                          'backgroundTaskManager',
+                        ),
+                        agentBackgroundConfig: readScoped(
+                          scopeCtx,
+                          AGENT_BACKGROUND_CONFIG_KEY,
+                          'agentBackgroundConfig',
+                        ),
                       })
                     ) {
                       return;
