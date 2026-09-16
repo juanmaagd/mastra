@@ -7742,6 +7742,7 @@ export class Agent<
       returnScorerData: options.returnScorerData,
       requireToolApproval: options.requireToolApproval,
       toolCallConcurrency: options.toolCallConcurrency,
+      eagerToolExecution: options.eagerToolExecution,
       resumeContext,
       agentId: this.id,
       agentVersionId: this.toRawConfig()?.resolvedVersionId as string | undefined,
