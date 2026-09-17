@@ -26,6 +26,21 @@ import { ObservationStrategy } from './base';
 import type { StrategyDeps } from './base';
 import type { ObservationRunOpts, ObserverOutput, ProcessedObservation } from './types';
 
+/** One thread's observer output, paired with the messages it was derived from. */
+type ObservationResult = {
+  threadId: string;
+  threadMessages: MastraDBMessage[];
+  result: {
+    observations: string;
+    currentTask?: string;
+    suggestedContinuation?: string;
+    threadTitle?: string;
+    extractedValues?: Record<string, unknown>;
+    extractionFailures?: Array<{ slug: string; error: string }>;
+    extractors?: readonly Extractor<any>[];
+  };
+};
+
 export class ResourceScopedObservationStrategy extends ObservationStrategy {
   private readonly startedAt = new Date().toISOString();
   private cycleId?: string;
@@ -50,22 +65,16 @@ export class ResourceScopedObservationStrategy extends ObservationStrategy {
   >();
   private totalBatchUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
   private lastBatchProviderMetadata: ProviderMetadata | undefined;
-  private observationResults: Array<{
-    threadId: string;
-    threadMessages: MastraDBMessage[];
-    result: {
-      observations: string;
-      currentTask?: string;
-      suggestedContinuation?: string;
-      threadTitle?: string;
-      extractedValues?: Record<string, unknown>;
-      extractionFailures?: Array<{ slug: string; error: string }>;
-      extractors?: readonly Extractor<any>[];
-    };
-  }> = [];
+  private observationResults: ObservationResult[] = [];
   private priorMetadataByThread = new Map<string, ThreadOMMetadata>();
 
-  /** Threads dropped from this cycle because they were deleted before `process()` ran. */
+  /**
+   * Observations the cycle started from, kept so `persist` can rebuild the record text
+   * after re-checking thread liveness at write time.
+   */
+  private cycleBaseObservations = '';
+
+  /** Threads dropped from this cycle because they were deleted. */
   private droppedDeletedThreads = 0;
 
   constructor(deps: StrategyDeps, opts: ObservationRunOpts) {
@@ -295,37 +304,91 @@ export class ResourceScopedObservationStrategy extends ObservationStrategy {
     };
   }
 
+  /**
+   * Returns whether the thread still exists, logging and counting the drop when not.
+   *
+   * The sync and async-buffer guards key off the observational-memory record, but in
+   * resource scope the record is keyed by resource and survives every one of its
+   * threads being deleted — `clearObservationalMemory(threadId, resourceId)` only
+   * clears the thread-keyed record — so that check reads as live here and cannot be
+   * reused. The thread itself is the only liveness signal available.
+   */
+  private async threadStillExists(threadId: string): Promise<boolean> {
+    if (await this.storage.getThreadById({ threadId })) {
+      return true;
+    }
+
+    this.droppedDeletedThreads++;
+    omDebug(`[OM:resource-scoped] skipping thread ${threadId}: thread no longer exists`);
+    return false;
+  }
+
+  /** Merge each result's observations into `baseObservations` and collect their metadata updates. */
+  private async mergeObservationResults(
+    baseObservations: string,
+    results: readonly ObservationResult[],
+  ): Promise<{
+    observations: string;
+    observationTokens: number;
+    cycleObservationTokens: number;
+    sections: string[];
+    threadMetadataUpdates: NonNullable<ProcessedObservation['threadMetadataUpdates']>;
+  }> {
+    let observations = baseObservations;
+    let cycleObservationTokens = 0;
+    const sections: string[] = [];
+    const threadMetadataUpdates: NonNullable<ProcessedObservation['threadMetadataUpdates']> = [];
+
+    for (const obsResult of results) {
+      const { threadId, threadMessages, result } = obsResult;
+
+      cycleObservationTokens += this.tokenCounter.countObservations(result.observations);
+
+      const messageRange = this.retrieval ? buildMessageRange(threadMessages) : undefined;
+      const threadSection = await this.wrapWithThreadTag(threadId, result.observations, messageRange);
+      sections.push(threadSection);
+
+      const threadLastObservedAt = this.getMaxMessageTimestamp(threadMessages);
+      observations = this.replaceOrAppendThreadSection(observations, threadId, threadSection, threadLastObservedAt);
+      threadMetadataUpdates.push({
+        threadId,
+        lastObservedAt: threadLastObservedAt.toISOString(),
+        suggestedResponse: result.suggestedContinuation,
+        currentTask: result.currentTask,
+        threadTitle: result.threadTitle,
+        extracted: result.extractedValues,
+        extractionFailures: result.extractionFailures,
+        extractors: result.extractors,
+        lastObservedMessageCursor: getLastObservedMessageCursor(threadMessages),
+      });
+    }
+
+    return {
+      observations,
+      observationTokens: this.tokenCounter.countObservations(observations),
+      cycleObservationTokens,
+      sections,
+      threadMetadataUpdates,
+    };
+  }
+
   async process(_output: ObserverOutput, existingObservations: string): Promise<ProcessedObservation> {
     const { record } = this.opts;
 
-    // The observer call above is unbounded, so a thread that `prepare()` snapshotted
-    // can be deleted by the time this runs. The sync and async-buffer guards key off
-    // the observational-memory record, but in resource scope the record is keyed by
-    // resource and survives every one of its threads being deleted —
-    // `clearObservationalMemory(threadId, resourceId)` only clears the thread-keyed
-    // record — so that check reads as live here and cannot be reused. Re-check the
-    // thread itself. Without this, the cycle appends the deleted thread's
-    // observations to the shared record, where resource-scoped context serves them
-    // to every other thread of the resource.
-    const liveThreadIds = new Set<string>();
-    for (const threadId of this.threadOrder) {
-      if (await this.storage.getThreadById({ threadId })) {
-        liveThreadIds.add(threadId);
-      } else {
-        this.droppedDeletedThreads++;
-        omDebug(`[OM:resource-scoped] skipping thread ${threadId}: thread no longer exists`);
-      }
-    }
-
+    // The observer call above is unbounded, so a thread that `prepare()` snapshotted can
+    // be deleted by the time this runs. A deleted thread must contribute neither a
+    // section to the shared resource record — where resource-scoped context serves it to
+    // every other thread of the resource — nor entries to the vector index.
+    this.cycleBaseObservations = existingObservations;
     this.observationResults = [];
     for (const threadId of this.threadOrder) {
-      if (!liveThreadIds.has(threadId)) continue;
-
       const threadMessages = this.messagesByThread.get(threadId) ?? [];
       if (threadMessages.length === 0) continue;
 
       const result = this.multiThreadResults.get(threadId);
       if (!result) continue;
+
+      if (!(await this.threadStillExists(threadId))) continue;
 
       const previousValues = getPriorExtractedValues(
         this.priorMetadataByThread.get(threadId),
@@ -360,6 +423,11 @@ export class ResourceScopedObservationStrategy extends ObservationStrategy {
         abortSignal: this.opts.abortSignal,
         requestContext: this.opts.requestContext,
       });
+
+      // Hooks are awaited and can run arbitrarily long, so re-check: a thread deleted
+      // during the hook must not be added to the results.
+      if (!(await this.threadStillExists(threadId))) continue;
+
       this.observationResults.push({
         threadId,
         threadMessages,
@@ -371,50 +439,23 @@ export class ResourceScopedObservationStrategy extends ObservationStrategy {
       });
     }
 
-    let currentObservations = existingObservations;
-    let cycleObservationTokens = 0;
-    const threadMetadataUpdates: ProcessedObservation['threadMetadataUpdates'] = [];
+    const merged = await this.mergeObservationResults(existingObservations, this.observationResults);
 
-    for (const obsResult of this.observationResults) {
+    for (const [index, obsResult] of this.observationResults.entries()) {
       const { threadId, threadMessages, result } = obsResult;
-
-      cycleObservationTokens += this.tokenCounter.countObservations(result.observations);
-
-      const messageRange = this.retrieval ? buildMessageRange(threadMessages) : undefined;
-      const threadSection = await this.wrapWithThreadTag(threadId, result.observations, messageRange);
-      const threadLastObservedAt = this.getMaxMessageTimestamp(threadMessages);
-      currentObservations = this.replaceOrAppendThreadSection(
-        currentObservations,
-        threadId,
-        threadSection,
-        threadLastObservedAt,
-      );
-      threadMetadataUpdates!.push({
-        threadId,
-        lastObservedAt: threadLastObservedAt.toISOString(),
-        suggestedResponse: result.suggestedContinuation,
-        currentTask: result.currentTask,
-        threadTitle: result.threadTitle,
-        extracted: result.extractedValues,
-        extractionFailures: result.extractionFailures,
-        extractors: result.extractors,
-        lastObservedMessageCursor: getLastObservedMessageCursor(threadMessages),
-      });
-
-      const isFirstThread = this.observationResults.indexOf(obsResult) === 0;
       this.deps.emitDebugEvent({
         type: 'observation_complete',
         timestamp: new Date(),
         threadId,
         resourceId: this.resourceId,
-        observations: threadSection,
+        observations: merged.sections[index]!,
         rawObserverOutput: result.observations,
         previousObservations: record.activeObservations,
         messages: threadMessages.map(m => ({
           role: m.role,
           content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
         })),
-        usage: isFirstThread && this.totalBatchUsage.totalTokens > 0 ? this.totalBatchUsage : undefined,
+        usage: index === 0 && this.totalBatchUsage.totalTokens > 0 ? this.totalBatchUsage : undefined,
       });
     }
 
@@ -423,29 +464,60 @@ export class ResourceScopedObservationStrategy extends ObservationStrategy {
     const newMessageIds = observedMessages.map(m => m.id);
     const existingIds = record.observedMessageIds ?? [];
     const observedMessageIds = [...new Set([...existingIds, ...newMessageIds])];
-    const observationTokens = this.tokenCounter.countObservations(currentObservations);
 
     return {
-      observations: currentObservations,
-      observationTokens,
-      cycleObservationTokens,
+      observations: merged.observations,
+      observationTokens: merged.observationTokens,
+      cycleObservationTokens: merged.cycleObservationTokens,
       observedMessageIds,
       lastObservedAt,
-      threadMetadataUpdates,
+      threadMetadataUpdates: merged.threadMetadataUpdates,
     };
   }
 
   async persist(processed: ProcessedObservation) {
     const { record, resourceId } = this.opts;
 
-    // Every thread in this cycle was deleted before `process()` ran. There is nothing
-    // to append, and writing `processed` would push the shared resource record's
-    // `lastObservedAt` (which falls back to "now" when no messages were observed) past
-    // unobserved messages of other threads that rely on that record-level watermark.
-    if (this.observationResults.length === 0 && this.droppedDeletedThreads > 0) {
-      omDebug(
-        `[OM:resource-scoped] skipping persist for resource ${resourceId}: all ${this.droppedDeletedThreads} observed threads were deleted`,
-      );
+    // Last chance to catch a delete: `process()` checked liveness, but its final check is
+    // however long the merge took away from this write, and the shared resource record
+    // gives the write no backstop — unlike the thread-scoped record, which the store
+    // rejects once it is gone.
+    const liveResults: ObservationResult[] = [];
+    for (const obsResult of this.observationResults) {
+      if (await this.threadStillExists(obsResult.threadId)) {
+        liveResults.push(obsResult);
+      }
+    }
+
+    if (liveResults.length !== this.observationResults.length) {
+      // Rebuild the record text and metadata updates from the surviving threads so the
+      // deleted ones contribute nothing to the record, the vector index, the end
+      // markers, or the reflection that runs after this. Mutate `processed` rather than
+      // rebinding: the cycle's caller reads it after this returns.
+      const rebuilt = await this.mergeObservationResults(this.cycleBaseObservations, liveResults);
+      const observedMessages = liveResults.flatMap(r => r.threadMessages);
+      Object.assign(processed, {
+        observations: rebuilt.observations,
+        observationTokens: rebuilt.observationTokens,
+        cycleObservationTokens: rebuilt.cycleObservationTokens,
+        threadMetadataUpdates: rebuilt.threadMetadataUpdates,
+        observedMessageIds: [
+          ...new Set([...(record.observedMessageIds ?? []), ...observedMessages.map(message => message.id)]),
+        ],
+        lastObservedAt: this.getMaxMessageTimestamp(observedMessages),
+      });
+      this.observationResults = liveResults;
+    }
+
+    if (liveResults.length === 0 && this.droppedDeletedThreads > 0) {
+      // Nothing survived. Skip the write: there is nothing to append, and
+      // `processed.lastObservedAt` (which falls back to "now" when no messages were
+      // observed) would push the shared record's watermark past other threads'
+      // unobserved messages, which rely on it. Skipping also leaves
+      // `pendingMessageTokens` alone. When there was nothing to observe in the first
+      // place, `droppedDeletedThreads` is 0 and the pre-existing no-op write below still
+      // resets pending tokens.
+      omDebug(`[OM:resource-scoped] skipping persist for resource ${resourceId}: observed threads were deleted`);
       return;
     }
 

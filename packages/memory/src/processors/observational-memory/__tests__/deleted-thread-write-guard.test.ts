@@ -18,6 +18,8 @@ import { InMemoryMemory, InMemoryDB } from '@mastra/core/storage';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 import { BufferingCoordinator } from '../buffering-coordinator';
+import { Extractor } from '../extractor';
+import { ResourceScopedObservationStrategy } from '../observation-strategies/resource-scoped';
 import { ObservationalMemory } from '../observational-memory';
 
 const OBSERVATION_TEXT = `<observations>
@@ -123,6 +125,8 @@ function createOM(
     messageTokens?: number;
     bufferTokens?: number | false;
     scope?: 'thread' | 'resource';
+    /** Extra extractors, e.g. a `mode: 'hook'` extractor used to interleave a deletion. */
+    extractors?: Extractor<any>[];
   },
 ) {
   return new ObservationalMemory({
@@ -134,6 +138,7 @@ function createOM(
       model: opts.model as never,
       messageTokens: opts.messageTokens ?? 50,
       bufferTokens: opts.bufferTokens ?? false,
+      extract: opts.extractors,
     },
     reflection: { model: createObserverModel() as never, observationTokens: 10_000_000 },
   });
@@ -329,6 +334,79 @@ describe('deleted-thread write guards', () => {
       expect(resourceRecord!.activeObservations).toContain('deploy-key');
       expect(resourceRecord!.activeObservations).toContain(`<thread id="${threadId}">`);
       expect(await storage.getThreadById({ threadId })).toBeTruthy();
+    });
+
+    it('does not add a thread that is deleted while an extractor hook is running', async () => {
+      // The extractor hook runs after the observer call and is awaited, so a deletion
+      // inside it lands between the liveness check at the top of `process()` and the
+      // point the thread's observations would be kept.
+      const onIndexObservations = vi.fn().mockResolvedValue(undefined);
+      const updateActive = vi.spyOn(storage, 'updateActiveObservations');
+      await seedThread(storage, threadId, resourceId);
+
+      const om = createOM(storage, {
+        model: createObserverModel(undefined, resourceScopedObs()),
+        onIndexObservations,
+        scope: 'resource',
+        extractors: [
+          new Extractor({
+            name: 'probe-delete-thread',
+            mode: 'hook',
+            onExtracted: async () => {
+              await simulateThreadDeletion(storage, threadId, resourceId);
+            },
+          }),
+        ],
+      });
+      const messages = createBulkMessages(5, threadId).map(message => ({ ...message, resourceId }));
+
+      await om.observe({ threadId, resourceId, messages });
+
+      expect(await storage.getThreadById({ threadId })).toBeNull();
+      const resourceRecord = await storage.getObservationalMemory(null, resourceId);
+      expect(resourceRecord).toBeTruthy();
+      expect(resourceRecord!.activeObservations).not.toContain('deploy-key');
+      expect(resourceRecord!.activeObservations).not.toContain(`<thread id="${threadId}">`);
+      expect(onIndexObservations).not.toHaveBeenCalled();
+      expect(updateActive).not.toHaveBeenCalled();
+    });
+
+    it('does not add a thread deleted between process() and persist()', async () => {
+      // `process()` merges the record text; `persist()` writes it. A deletion in that gap
+      // is only covered by persist()'s own liveness check, which rebuilds the text.
+      const onIndexObservations = vi.fn().mockResolvedValue(undefined);
+      const updateActive = vi.spyOn(storage, 'updateActiveObservations');
+      await seedThread(storage, threadId, resourceId);
+
+      const originalProcess = ResourceScopedObservationStrategy.prototype.process;
+      const processSpy = vi
+        .spyOn(ResourceScopedObservationStrategy.prototype, 'process')
+        .mockImplementation(async function (this: ResourceScopedObservationStrategy, ...args) {
+          const result = await originalProcess.apply(this, args);
+          await simulateThreadDeletion(storage, threadId, resourceId);
+          return result;
+        });
+
+      try {
+        const om = createOM(storage, {
+          model: createObserverModel(undefined, resourceScopedObs()),
+          onIndexObservations,
+          scope: 'resource',
+        });
+        const messages = createBulkMessages(5, threadId).map(message => ({ ...message, resourceId }));
+
+        await om.observe({ threadId, resourceId, messages });
+      } finally {
+        processSpy.mockRestore();
+      }
+
+      expect(await storage.getThreadById({ threadId })).toBeNull();
+      const resourceRecord = await storage.getObservationalMemory(null, resourceId);
+      expect(resourceRecord).toBeTruthy();
+      expect(resourceRecord!.activeObservations).not.toContain('deploy-key');
+      expect(resourceRecord!.activeObservations).not.toContain(`<thread id="${threadId}">`);
+      expect(onIndexObservations).not.toHaveBeenCalled();
+      expect(updateActive).not.toHaveBeenCalled();
     });
   });
 });
